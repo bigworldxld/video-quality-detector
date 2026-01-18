@@ -58,11 +58,11 @@ async function handleVideoDetection(request, env, corsHeaders) {
       );
     }
 
-    // 检查文件大小（限制 50MB）
-    const maxSize = 50 * 1024 * 1024;
+    // 检查文件大小（限制 1024MB）
+    const maxSize = 1024 * 1024 * 1024;
     if (videoFile.size > maxSize) {
       return new Response(
-        JSON.stringify({ error: '视频文件大小不能超过 50MB' }),
+        JSON.stringify({ error: '视频文件大小不能超过 1024MB' }),
         { 
           status: 400,
           headers: { ...corsHeaders, 'Content-Type': 'application/json' }
@@ -393,7 +393,7 @@ function getHTML() {
       <div class="upload-area" id="uploadArea">
         <div class="upload-icon">📹</div>
         <div class="upload-text">点击或拖拽视频文件到此处</div>
-        <div class="upload-hint">支持 MP4, AVI, MOV 等格式，最大 50MB</div>
+        <div class="upload-hint">支持 MP4, AVI, MOV 等格式，最大 1024MB</div>
         <input type="file" id="videoInput" accept="video/*">
       </div>
 
@@ -467,8 +467,8 @@ function getHTML() {
         return;
       }
 
-      if (file.size > 50 * 1024 * 1024) {
-        showError('文件大小不能超过 50MB');
+      if (file.size > 1024 * 1024 * 1024) {
+        showError('文件大小不能超过 1024MB');
         return;
       }
 
