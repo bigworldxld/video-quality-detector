@@ -1,0 +1,24 @@
+{
+  "name": "video-quality-detector",
+  "version": "1.0.0",
+  "description": "AI-powered video quality detection system for Cloudflare",
+  "main": "src/index.js",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "start": "wrangler dev"
+  },
+  "keywords": [
+    "video",
+    "quality",
+    "detection",
+    "ai",
+    "cloudflare"
+  ],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "wrangler": "^3.0.0"
+  }
+}
+
