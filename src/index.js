@@ -780,10 +780,20 @@ function getHTML() {
       videoSource = 'file';
       const url = URL.createObjectURL(file);
       previewVideo.src = url;
+      previewVideo.crossOrigin = null; // 本地文件不需要 CORS
       videoPreview.style.display = 'block';
       detectBtn.disabled = false;
       results.classList.remove('show');
       hideError();
+
+      // 等待视频加载元数据
+      previewVideo.addEventListener('loadedmetadata', () => {
+        console.log('视频元数据加载完成:', {
+          duration: previewVideo.duration,
+          width: previewVideo.videoWidth,
+          height: previewVideo.videoHeight
+        });
+      }, { once: true });
     }
 
     // URL 加载视频
@@ -861,17 +871,53 @@ function getHTML() {
 
     // 开始检测
     detectBtn.addEventListener('click', async () => {
-      if (!selectedFile) return;
+      // 检查是否有视频源（文件或URL）
+      if (!selectedFile && !previewVideo.src) {
+        showError('请先上传视频文件或输入视频 URL');
+        return;
+      }
 
       detectBtn.disabled = true;
       loading.classList.add('show');
       results.classList.remove('show');
       hideError();
 
+      console.log('开始检测，视频源:', videoSource, '使用AI:', aiToggle.checked);
+
       try {
-        // 提取视频帧
-        const frames = await extractVideoFrames(previewVideo, 5);
+        // 检查视频是否已加载
+        if (!previewVideo.videoWidth || !previewVideo.videoHeight) {
+          throw new Error('视频尺寸未知，请等待视频加载完成后再试');
+        }
+
+        if (!previewVideo.duration || isNaN(previewVideo.duration) || previewVideo.duration <= 0) {
+          throw new Error('视频时长无效，请检查视频文件是否正确');
+        }
+
+        console.log('视频信息:', {
+          width: previewVideo.videoWidth,
+          height: previewVideo.videoHeight,
+          duration: previewVideo.duration
+        });
+
+        // 更新加载提示
+        const loadingText = loading.querySelector('p');
+        if (loadingText) loadingText.textContent = '正在提取视频帧...';
+
+        console.log('开始提取视频帧...');
         
+        // 提取视频帧（添加超时保护）
+        const frames = await Promise.race([
+          extractVideoFrames(previewVideo, 5),
+          new Promise((_, reject) => 
+            setTimeout(() => reject(new Error('视频帧提取超时（30秒），请重试')), 30000)
+          )
+        ]);
+
+        console.log('成功提取帧数:', frames.length);
+
+        if (loadingText) loadingText.textContent = '正在分析视频，请稍候...';
+
         const formData = new FormData();
         
         // 根据视频来源添加数据
@@ -889,12 +935,29 @@ function getHTML() {
           formData.append(\`frame_\${index}\`, frame, \`frame_\${index}.jpg\`);
         });
 
+        console.log('发送检测请求...');
+        
         const response = await fetch('/api/detect', {
           method: 'POST',
           body: formData,
         });
 
+        console.log('检测响应状态:', response.status);
+
+        if (!response.ok) {
+          const errorText = await response.text();
+          console.error('检测请求失败:', errorText);
+          let errorData;
+          try {
+            errorData = JSON.parse(errorText);
+          } catch (e) {
+            errorData = { error: errorText || '检测失败' };
+          }
+          throw new Error(errorData.error || '检测失败');
+        }
+
         const data = await response.json();
+        console.log('检测完成，结果:', data);
 
         if (!response.ok) {
           throw new Error(data.error || '检测失败');
@@ -902,9 +965,18 @@ function getHTML() {
 
         displayResults(data);
       } catch (error) {
-        showError(error.message);
+        console.error('检测过程错误:', error);
+        const errorMessage = error.message || '检测失败，请重试';
+        console.error('错误详情:', {
+          message: errorMessage,
+          stack: error.stack,
+          name: error.name
+        });
+        showError(errorMessage);
       } finally {
         loading.classList.remove('show');
+        const loadingText = loading.querySelector('p');
+        if (loadingText) loadingText.textContent = '正在分析视频，请稍候...';
         detectBtn.disabled = false;
       }
     });
@@ -916,51 +988,104 @@ function getHTML() {
      * @returns {Promise<Array<Blob>>} 提取的帧图像
      */
     async function extractVideoFrames(video, count = 5) {
-      return new Promise((resolve, reject) => {
-        const frames = [];
-        const canvas = document.createElement('canvas');
-        const ctx = canvas.getContext('2d');
+      // 检查视频是否已准备好
+      if (!video.videoWidth || !video.videoHeight || !video.duration || isNaN(video.duration)) {
+        throw new Error('视频未准备好，无法提取帧');
+      }
+
+      const canvas = document.createElement('canvas');
+      const ctx = canvas.getContext('2d');
+      
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+      
+      const duration = video.duration;
+      const interval = Math.max(0.1, duration / (count + 1));
+      const frames = [];
+      
+      // 顺序提取帧，避免并发冲突
+      for (let i = 1; i <= count; i++) {
+        const time = Math.min(interval * i, duration - 0.1);
         
-        canvas.width = video.videoWidth || 640;
-        canvas.height = video.videoHeight || 480;
-        
-        let extractedCount = 0;
-        const duration = video.duration || 10;
-        const interval = duration / (count + 1);
-        
-        const extractFrame = (time) => {
-          return new Promise((resolveFrame) => {
-            video.currentTime = time;
-            
-            video.onseeked = () => {
-              try {
-                ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-                canvas.toBlob((blob) => {
-                  if (blob) {
-                    resolveFrame(blob);
-                  } else {
-                    resolveFrame(null);
-                  }
-                }, 'image/jpeg', 0.9);
-              } catch (error) {
-                console.error('提取帧失败:', error);
-                resolveFrame(null);
-              }
-            };
-          });
-        };
-        
-        // 提取多个时间点的帧
-        const extractPromises = [];
-        for (let i = 1; i <= count; i++) {
-          const time = interval * i;
-          extractPromises.push(extractFrame(time));
+        try {
+          const blob = await extractSingleFrame(video, canvas, ctx, time, i);
+          if (blob) {
+            frames.push(blob);
+          }
+        } catch (error) {
+          console.warn(\`提取第 \${i} 帧失败:\`, error);
+          // 继续提取其他帧
         }
+      }
+      
+      if (frames.length === 0) {
+        throw new Error('无法提取任何视频帧，请检查视频格式');
+      }
+      
+      return frames;
+    }
+
+    /**
+     * 提取单个视频帧
+     * @param {HTMLVideoElement} video - 视频元素
+     * @param {HTMLCanvasElement} canvas - 画布元素
+     * @param {CanvasRenderingContext2D} ctx - 画布上下文
+     * @param {number} time - 要提取的时间点（秒）
+     * @param {number} index - 帧索引
+     * @returns {Promise<Blob>} 提取的帧图像
+     */
+    function extractSingleFrame(video, canvas, ctx, time, index) {
+      return new Promise((resolve, reject) => {
+        // 设置超时
+        const timeout = setTimeout(() => {
+          reject(new Error(\`提取第 \${index} 帧超时\`));
+        }, 5000);
+
+        // 保存原始时间
+        const originalTime = video.currentTime;
+        let seeked = false;
+
+        const onSeeked = () => {
+          if (seeked) return; // 防止重复触发
+          seeked = true;
+          clearTimeout(timeout);
+          
+          try {
+            // 清除画布
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            // 绘制视频帧
+            ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+            // 转换为 Blob
+            canvas.toBlob((blob) => {
+              video.removeEventListener('seeked', onSeeked);
+              video.removeEventListener('error', onError);
+              
+              if (blob) {
+                resolve(blob);
+              } else {
+                reject(new Error('无法将帧转换为图像'));
+              }
+            }, 'image/jpeg', 0.9);
+          } catch (error) {
+            video.removeEventListener('seeked', onSeeked);
+            video.removeEventListener('error', onError);
+            clearTimeout(timeout);
+            reject(error);
+          }
+        };
+
+        const onError = (e) => {
+          clearTimeout(timeout);
+          video.removeEventListener('seeked', onSeeked);
+          video.removeEventListener('error', onError);
+          reject(new Error('视频跳转失败'));
+        };
+
+        video.addEventListener('seeked', onSeeked, { once: true });
+        video.addEventListener('error', onError, { once: true });
         
-        Promise.all(extractPromises).then((blobs) => {
-          const validFrames = blobs.filter(b => b !== null);
-          resolve(validFrames);
-        }).catch(reject);
+        // 设置视频时间
+        video.currentTime = time;
       });
     }
 
