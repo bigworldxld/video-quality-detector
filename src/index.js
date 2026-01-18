@@ -73,8 +73,19 @@ async function handleVideoDetection(request, env, corsHeaders) {
     // 读取视频文件
     const videoBuffer = await videoFile.arrayBuffer();
     
+    // 提取视频帧（如果前端已提取）
+    const extractedFrames = [];
+    for (const [key, value] of formData.entries()) {
+      if (key.startsWith('frame_') && value instanceof File) {
+        const frameBuffer = await value.arrayBuffer();
+        extractedFrames.push(new Uint8Array(frameBuffer));
+      }
+    }
+    
     // 分析视频元数据
     const metadata = await analyzeVideoMetadata(videoBuffer, videoFile.type);
+    // 添加提取的帧到元数据
+    metadata.extractedFrames = extractedFrames;
     
     // 检测文件损坏
     const corruptionCheck = detectCorruption(videoBuffer);
@@ -490,10 +501,18 @@ function getHTML() {
       results.classList.remove('show');
       hideError();
 
-      const formData = new FormData();
-      formData.append('video', selectedFile);
-
       try {
+        // 提取视频帧
+        const frames = await extractVideoFrames(previewVideo, 5);
+        
+        const formData = new FormData();
+        formData.append('video', selectedFile);
+        
+        // 将提取的帧添加到 FormData
+        frames.forEach((frame, index) => {
+          formData.append(\`frame_\${index}\`, frame, \`frame_\${index}.jpg\`);
+        });
+
         const response = await fetch('/api/detect', {
           method: 'POST',
           body: formData,
@@ -513,6 +532,61 @@ function getHTML() {
         detectBtn.disabled = false;
       }
     });
+
+    /**
+     * 从视频中提取帧
+     * @param {HTMLVideoElement} video - 视频元素
+     * @param {number} count - 要提取的帧数
+     * @returns {Promise<Array<Blob>>} 提取的帧图像
+     */
+    async function extractVideoFrames(video, count = 5) {
+      return new Promise((resolve, reject) => {
+        const frames = [];
+        const canvas = document.createElement('canvas');
+        const ctx = canvas.getContext('2d');
+        
+        canvas.width = video.videoWidth || 640;
+        canvas.height = video.videoHeight || 480;
+        
+        let extractedCount = 0;
+        const duration = video.duration || 10;
+        const interval = duration / (count + 1);
+        
+        const extractFrame = (time) => {
+          return new Promise((resolveFrame) => {
+            video.currentTime = time;
+            
+            video.onseeked = () => {
+              try {
+                ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+                canvas.toBlob((blob) => {
+                  if (blob) {
+                    resolveFrame(blob);
+                  } else {
+                    resolveFrame(null);
+                  }
+                }, 'image/jpeg', 0.9);
+              } catch (error) {
+                console.error('提取帧失败:', error);
+                resolveFrame(null);
+              }
+            };
+          });
+        };
+        
+        // 提取多个时间点的帧
+        const extractPromises = [];
+        for (let i = 1; i <= count; i++) {
+          const time = interval * i;
+          extractPromises.push(extractFrame(time));
+        }
+        
+        Promise.all(extractPromises).then((blobs) => {
+          const validFrames = blobs.filter(b => b !== null);
+          resolve(validFrames);
+        }).catch(reject);
+      });
+    }
 
     function displayResults(data) {
       const issues = data.results?.issues || {};

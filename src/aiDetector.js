@@ -9,7 +9,7 @@
  */
 export async function detectWithHuggingFace(videoSamples, metadata, env) {
   const HF_API_KEY = env.HF_API_KEY || '';
-  const baseUrl = 'https://api-inference.huggingface.co/models';
+  const baseUrl = 'https://router.huggingface.co/hf-inference/models';
   
   const results = {
     glitch: false,
@@ -34,20 +34,34 @@ export async function detectWithHuggingFace(videoSamples, metadata, env) {
     
     // 如果有 Hugging Face API Key，可以调用实际的模型
     if (HF_API_KEY) {
-      // 示例：调用图像分类模型（需要将视频帧转换为图像）
-      // const modelResponse = await fetch(
-      //   `${baseUrl}/google/vit-base-patch16-224`,
-      //   {
-      //     method: 'POST',
-      //     headers: {
-      //       'Authorization': `Bearer ${HF_API_KEY}`,
-      //       'Content-Type': 'application/json',
-      //     },
-      //     body: JSON.stringify({
-      //       inputs: base64Image, // 需要将视频帧转换为 base64
-      //     }),
-      //   }
-      // );
+      // 检查是否有提取的视频帧图像
+      const videoFrames = metadata.extractedFrames || [];
+      
+      if (videoFrames.length > 0) {
+        // 对每个帧进行 AI 检测
+        const frameResults = await Promise.all(
+          videoFrames.slice(0, 5).map(async (frameData, index) => {
+            try {
+              return await analyzeFrameWithHF(frameData, HF_API_KEY, baseUrl, index);
+            } catch (error) {
+              console.error(`帧 ${index} 分析失败:`, error);
+              return null;
+            }
+          })
+        );
+
+        // 合并帧检测结果
+        const validResults = frameResults.filter(r => r !== null);
+        if (validResults.length > 0) {
+          const aiDetectedIssues = aggregateFrameResults(validResults);
+          // 合并 AI 检测结果到最终结果
+          Object.assign(results, aiDetectedIssues);
+          results.confidence = Math.max(results.confidence, 0.85);
+          results.details.push(`使用 AI 模型分析了 ${validResults.length} 个视频帧`);
+        }
+      } else {
+        results.details.push('提示：未检测到视频帧图像，使用规则引擎检测');
+      }
     }
 
     // 合并规则检测结果
@@ -165,6 +179,156 @@ function ruleBasedDetection(features, metadata) {
   results.details.push('偏色和人物画面检测需要视频帧图像分析');
 
   return results;
+}
+
+/**
+ * 使用 Hugging Face API 分析单个视频帧
+ * @param {Uint8Array|ArrayBuffer} frameData - 视频帧数据（二进制）
+ * @param {string} apiKey - Hugging Face API Key
+ * @param {string} baseUrl - API 基础 URL
+ * @param {number} frameIndex - 帧索引
+ */
+async function analyzeFrameWithHF(frameData, apiKey, baseUrl, frameIndex) {
+  try {
+    let imageData;
+
+    // 处理不同的输入格式
+    if (frameData instanceof ArrayBuffer) {
+      imageData = new Uint8Array(frameData);
+    } else if (frameData instanceof Uint8Array) {
+      imageData = frameData;
+    } else {
+      throw new Error('不支持的帧数据格式，需要 Uint8Array 或 ArrayBuffer');
+    }
+
+    // 调用 Hugging Face API（使用二进制图像数据，按照 curl 示例格式）
+    const response = await fetch(
+      `${baseUrl}/google/vit-base-patch16-224`,
+      {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${apiKey}`,
+          'Content-Type': 'image/jpeg', // 使用 image/jpeg 作为 Content-Type
+        },
+        body: imageData, // 直接发送二进制数据（--data-binary 格式）
+      }
+    );
+
+    if (!response.ok) {
+      let errorText = '';
+      try {
+        errorText = await response.text();
+      } catch (e) {
+        errorText = `HTTP ${response.status}`;
+      }
+      
+      // 如果是模型加载中，等待后重试
+      if (response.status === 503) {
+        const retryAfter = response.headers.get('Retry-After') || '10';
+        // 可以选择重试逻辑
+        throw new Error(`模型正在加载，请稍后重试 (等待 ${retryAfter} 秒)`);
+      }
+      
+      throw new Error(`API 请求失败 (${response.status}): ${errorText}`);
+    }
+
+    const result = await response.json();
+    
+    // 解析模型输出，检测视频质量问题
+    return {
+      frameIndex,
+      rawResult: result,
+      issues: parseModelOutput(result),
+    };
+  } catch (error) {
+    console.error(`帧 ${frameIndex} AI 分析错误:`, error);
+    throw error;
+  }
+}
+
+/**
+ * 解析模型输出，识别视频质量问题
+ */
+function parseModelOutput(modelResult) {
+  const issues = {
+    glitch: false,
+    corruption: false,
+    stutter: false,
+    colorShift: false,
+    missingPerson: false,
+  };
+
+  // 如果返回的是分类结果数组
+  if (Array.isArray(modelResult)) {
+    const labels = modelResult.map(item => 
+      item.label ? item.label.toLowerCase() : ''
+    ).join(' ');
+
+    // 检测花屏相关关键词
+    if (labels.includes('glitch') || labels.includes('corrupt') || labels.includes('error')) {
+      issues.glitch = true;
+      issues.corruption = true;
+    }
+
+    // 检测人物相关
+    if (!labels.includes('person') && !labels.includes('human') && !labels.includes('face')) {
+      // 如果预期有人物但未检测到，可能存在问题
+      // 这里需要根据实际场景调整
+    }
+  }
+
+  // 如果返回的是单个对象
+  if (modelResult.label) {
+    const label = modelResult.label.toLowerCase();
+    if (label.includes('glitch') || label.includes('corrupt')) {
+      issues.glitch = true;
+      issues.corruption = true;
+    }
+  }
+
+  return issues;
+}
+
+/**
+ * 聚合多个帧的检测结果
+ */
+function aggregateFrameResults(frameResults) {
+  const aggregated = {
+    glitch: false,
+    corruption: false,
+    stutter: false,
+    colorShift: false,
+    missingPerson: false,
+  };
+
+  // 统计每个问题的出现次数
+  const issueCounts = {
+    glitch: 0,
+    corruption: 0,
+    stutter: 0,
+    colorShift: 0,
+    missingPerson: 0,
+  };
+
+  frameResults.forEach(result => {
+    if (result && result.issues) {
+      Object.keys(result.issues).forEach(issue => {
+        if (result.issues[issue]) {
+          issueCounts[issue]++;
+        }
+      });
+    }
+  });
+
+  // 如果超过 30% 的帧检测到问题，则认为存在该问题
+  const threshold = frameResults.length * 0.3;
+  Object.keys(aggregated).forEach(issue => {
+    if (issueCounts[issue] > threshold) {
+      aggregated[issue] = true;
+    }
+  });
+
+  return aggregated;
 }
 
 /**
